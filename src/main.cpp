@@ -4,14 +4,15 @@
 
 int main() {
     try {
-        auto images = MNISTImage::import_set("data/train-labels.idx1-ubyte", "data/train-images.idx3-ubyte");
+        auto train_images = MNISTImage::import_set("data/train-labels.idx1-ubyte", "data/train-images.idx3-ubyte");
+        auto t10k_images  = MNISTImage::import_set("data/t10k-labels.idx1-ubyte", "data/t10k-images.idx3-ubyte");
 
-        NeuralNetwork nn;
+        NeuralNetwork nn{1};
 
         for (int i = 0; i < 50'000; i++) {
-            nn.forward(images[i]);
-            f32 loss = nn.backward(images[i].label, 0.01f);
-            if (i % 1000 == 0) {
+            nn.forward(train_images[i]);
+            f32 loss = nn.backward(train_images[i].label, 0.01f);
+            if (i % 5000 == 0) {
                 std::println("Step {}: Loss = {:.4f}", i, loss);
             }
         }
@@ -19,8 +20,8 @@ int main() {
         // Test accuracy on fresh data
         int correct = 0;
         for (int i = 50'000; i < 50100; i++) { // Use different images
-            nn.forward(images[i]);
-            if (nn.predict() == images[i].label)
+            nn.forward(train_images[i]);
+            if (nn.predict() == train_images[i].label)
                 correct++;
         }
         std::println("Final Accuracy: {}/100 = {}%", correct, correct);

@@ -22,7 +22,7 @@ void update_weights(float* weights, const float* gradients, float learning_rate,
 
 class NeuralNetwork {
 public:
-    NeuralNetwork();
+    NeuralNetwork(size_t batch_size = 64);
 
     ~NeuralNetwork() noexcept;
 
@@ -35,15 +35,19 @@ public:
     int predict();
 
 private:
-    Tensor<f32, 28 * 28> _x;     /* input */
-    Tensor<f32, 28 * 28, 10> _W; /* weights */
-    Tensor<f32, 10> _b;          /* biases */
-    Tensor<f32, 10> _y;          /* output */
+    const size_t B; /* batch size */
+    static constexpr size_t M = 28 * 28;
+    static constexpr size_t N = 10;
 
-    Tensor<f32, 28 * 28, 10> _dW; /* weight gradients */
-    Tensor<f32, 10> _db;          /* bias gradients */
-    Tensor<f32, 10> _dy;          /* output gradients */
-    Tensor<f32, 1> _loss;         /* loss tensor */
+    Tensor<f32, 2> _x{B, M}; /* input */
+    Tensor<f32, 2> _y{B, N}; /* output */
+    Tensor<f32, 2> _W{M, N}; /* weights */
+    Tensor<f32, 1> _b{N};    /* biases */
+
+    Tensor<f32, 2> _dy{B, N}; /* output gradients */
+    Tensor<f32, 2> _dW{M, N}; /* weight gradients */
+    Tensor<f32, 1> _db{N};    /* bias gradients */
+    Tensor<f32, 1> _loss{B};  /* loss tensor */
 
     cublasHandle_t _cublas_handle;
 };
