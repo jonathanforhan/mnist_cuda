@@ -11,8 +11,14 @@ NeuralNetwork::NeuralNetwork(int batch_size, int hidden_size)
     cublasCreate(&_cublas_handle);
 
     /* initialize */
-    xavier_init(_W, _W.size(), M, N);
-    zero_init(_b, _b.size());
+    kaiming_init(_W1, _W1.size(), M);
+    zero_init(_b1, _b1.size());
+
+    xavier_init(_W2, _W2.size(), H, N);
+    zero_init(_b2, _b2.size());
+
+    zero_init(_z1, _z1.size());
+    zero_init(_a1, _a1.size());
 }
 
 NeuralNetwork::~NeuralNetwork() noexcept {
@@ -26,8 +32,17 @@ void NeuralNetwork::forward(std::span<const MNISTImage> mnist_images) {
     normalize_u8_to_f32(_raw, _x, _x.size());
 
     const float alpha = 1.0f, beta = 0.0f;
-    cublasSgemv(_cublas_handle, CUBLAS_OP_T, M, N, &alpha, _W, M, _x, 1, &beta, _y, 1);
-    cublasSaxpy(_cublas_handle, N, &alpha, _b, 1, _y, 1);
+
+    // z1 = W1 @ x + b1
+    cublasSgemv(_cublas_handle, CUBLAS_OP_T, M, H, &alpha, _W1, M, _x, 1, &beta, _z1, 1);
+    cublasSaxpy(_cublas_handle, H, &alpha, _b1, 1, _z1, 1);
+
+    // a1 = ReLU(z1)
+    relu(_z1, _a1, 1, H);
+
+    // y = W2 @ a1 + b2
+    cublasSgemv(_cublas_handle, CUBLAS_OP_T, H, N, &alpha, _W2, H, _a1, 1, &beta, _y, 1);
+    cublasSaxpy(_cublas_handle, N, &alpha, _b2, 1, _y, 1);
 }
 
 f32 NeuralNetwork::backward(std::span<const u8> true_labels, f32 learning_rate) {
@@ -45,12 +60,21 @@ f32 NeuralNetwork::backward(std::span<const u8> true_labels, f32 learning_rate) 
     }
 
     float alpha = 1.0f, beta = 0.0f;
-    cublasSger(_cublas_handle, M, N, &alpha, _x, 1, _dy, 1, _dW, M);
-    cublasScopy(_cublas_handle, N, _dy, 1, _db, 1);
 
-    const float neg_lr = -learning_rate;
-    cublasSaxpy(_cublas_handle, _W.size(), &neg_lr, _dW, 1, _W, 1);
-    cublasSaxpy(_cublas_handle, _b.size(), &neg_lr, _db, 1, _b, 1);
+    // dW2 = a1 @ dy
+    cublasSger(_cublas_handle, H, N, &alpha, _a1, 1, _dy, 1, _dW2, H);
+    // db2 = dy
+    cublasScopy(_cublas_handle, N, _dy, 1, _db2, 1);
+
+    // da1 = W2.T @ dy
+    cublasSgemv(_cublas_handle, CUBLAS_OP_N, H, N, &alpha, _W2, H, _dy, 1, &beta, _da1, 1);
+    // dz1 = da1 @ ReLU'(z1)
+    relu_backwards(_dz1, _z1, _da1, 1, H);
+
+    // dW1 = x outer dz1
+    cublasSger(_cublas_handle, M, H, &alpha, _x, 1, _dz1, 1, _dW1, M);
+    // db1 = dz1
+    cublasScopy(_cublas_handle, H, _dz1, 1, _db1, 1);
 
     return loss;
 }

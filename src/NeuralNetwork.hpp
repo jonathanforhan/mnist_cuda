@@ -35,12 +35,20 @@ private:
 
     Tensor<f32> _x{M};
     Tensor<f32> _y{N};
-    Tensor<f32> _W{M, N};
-    Tensor<f32> _b{N};
+    Tensor<f32> _z1{H};
+    Tensor<f32> _a1{H};
+    Tensor<f32> _W1{M, H};
+    Tensor<f32> _b1{H};
+    Tensor<f32> _W2{H, N};
+    Tensor<f32> _b2{N};
 
     Tensor<f32> _dy{N};
-    Tensor<f32> _dW{M, N};
-    Tensor<f32> _db{N};
+    Tensor<f32> _dz1{H};
+    Tensor<f32> _da1{H};
+    Tensor<f32> _dW1{M, H};
+    Tensor<f32> _db1{H};
+    Tensor<f32> _dW2{H, N};
+    Tensor<f32> _db2{N};
     Tensor<f32> _loss{1};
     Tensor<u8> _labels{1};
     Tensor<u8> _raw{M};
