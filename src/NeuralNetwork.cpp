@@ -1,63 +1,74 @@
-#include "NeuralNetwork.hpp"
+﻿#include "NeuralNetwork.hpp"
 
-#include <array>
 #include <cublas_v2.h>
+#include <cassert>
+#include <cmath>
+#include "kernels.h"
 
-NeuralNetwork::NeuralNetwork(size_t batch_size)
-    : B{batch_size} {
+NeuralNetwork::NeuralNetwork(int batch_size, int hidden_size)
+    : B{batch_size},
+      H{hidden_size} {
     cublasCreate(&_cublas_handle);
 
-    xavier_init(_W, _W.capacity());
-    zero_init(_b, _b.capacity());
+    /* initialize */
+    xavier_init(_W, _W.size(), M, N);
+    zero_init(_b, _b.size());
 }
 
 NeuralNetwork::~NeuralNetwork() noexcept {
     cublasDestroy(_cublas_handle);
 }
 
-void NeuralNetwork::forward(const MNISTImage& mnist_image) {
-    Tensor<u8, 1> gpu_pixels{28 * 28};
-    gpu_pixels.from_host(mnist_image.pixels);
+void NeuralNetwork::forward(std::span<const MNISTImage> mnist_images) {
+    /* when not training mnist_images may be less than B * M */
 
-    launch_normalize_mnist(gpu_pixels, _x, gpu_pixels.capacity());
+    _raw.from_host(std::span{(const u8*)mnist_images.data(), mnist_images.size_bytes()});
+    normalize_u8_to_f32(_raw, _x, _x.size());
 
-    // y = alpha * A^T * x + beta * y
     const float alpha = 1.0f, beta = 0.0f;
-    int m = _W.size()[0], n = _W.size()[1];
-
-    cublasSgemv(_cublas_handle, CUBLAS_OP_T, m, n, &alpha, _W, m, _x, 1, &beta, _y, 1);
-    add_bias(_y, _b, _y, 10);
-    relu_activation(_y, _y, 10);
+    cublasSgemv(_cublas_handle, CUBLAS_OP_T, M, N, &alpha, _W, M, _x, 1, &beta, _y, 1);
+    cublasSaxpy(_cublas_handle, N, &alpha, _b, 1, _y, 1);
 }
 
-f32 NeuralNetwork::backward(int true_label, f32 learning_rate) {
-    // Compute loss and output gradients
-    softmax_cross_entropy(_y, true_label, _loss, _dy, 10);
+f32 NeuralNetwork::backward(std::span<const u8> true_labels, f32 learning_rate) {
+    assert(true_labels.size_bytes() == B);
 
-    // A = alpha * x * y^T + A
-    const float alpha = 1.0f;
-    int m = _dW.size()[0], n = _dW.size()[1];
+    _labels.from_host(true_labels);
 
-    compute_weight_gradients(_x, _dy, _dW, 784, 10);
+    softmax_cross_entropy(_y, _labels, _loss, _dy, 1, N);
 
-    update_weights(_W, _dW, learning_rate, 784 * 10);
-    update_weights(_b, _dy, learning_rate, 10);
+    f32 loss;
+    _loss.to_host({&loss, 1});
 
-    // Return loss
-    std::array<f32, 1> loss_cpu;
-    _loss.to_host(loss_cpu);
-    return loss_cpu[0];
+    if (loss < 1e-6f) {
+        return loss;
+    }
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasSger(_cublas_handle, M, N, &alpha, _x, 1, _dy, 1, _dW, M);
+    cublasScopy(_cublas_handle, N, _dy, 1, _db, 1);
+
+    const float neg_lr = -learning_rate;
+    cublasSaxpy(_cublas_handle, _W.size(), &neg_lr, _dW, 1, _W, 1);
+    cublasSaxpy(_cublas_handle, _b.size(), &neg_lr, _db, 1, _b, 1);
+
+    return loss;
 }
 
-void NeuralNetwork::train_step(const MNISTImage& mnist_image, f32 learning_rate) {
-    forward(mnist_image);
-    f32 loss = backward(mnist_image.label, learning_rate);
+f32 NeuralNetwork::train(std::span<const MNISTImage> images, std::span<const u8> labels, f32 learning_rate) {
+    assert(images.size_bytes() == B * M);
+    assert(labels.size_bytes() == B);
+
+    forward(images);
+    f32 loss = backward(labels, learning_rate);
+
+    return loss;
 }
 
-int NeuralNetwork::predict() {
+void NeuralNetwork::predict(std::span<u8> output) {
     // Get output back to CPU and find max
-    std::vector<float> cpu_output(10);
+    std::vector<float> cpu_output(N);
     _y.to_host(std::span<float>(cpu_output));
 
-    return std::max_element(cpu_output.begin(), cpu_output.end()) - cpu_output.begin();
+    output[0] = (u8)(std::max_element(cpu_output.begin(), cpu_output.end()) - cpu_output.begin());
 }

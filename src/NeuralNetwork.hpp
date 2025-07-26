@@ -1,53 +1,49 @@
 #pragma once
 
-#include "MNISTImage.hpp"
-#include "Tensor.hpp"
 #include <cublas_v2.h>
-
-void xavier_init(float* weights, int n);
-void zero_init(float* data, int n);
-void launch_normalize_mnist(const uint8_t* input, float* output, size_t n);
-void linear_forward(const float* weights, const float* input, float* output, int input_size, int output_size);
-void add_bias(const float* x, const float* bias, float* y, int n);
-void relu_activation(const float* x, float* y, int n);
-void softmax_cross_entropy(const float* logits, int true_label, float* loss, float* gradients, int n);
-void compute_loss_and_gradients(const float* output, int true_label, float* loss, float* output_gradients, int n);
-void compute_loss_and_gradients(const float* output, int true_label, float* loss, float* output_gradients, int n);
-void compute_weight_gradients(const float* input,
-                              const float* output_gradients,
-                              float* weight_gradients,
-                              int input_size,
-                              int output_size);
-void update_weights(float* weights, const float* gradients, float learning_rate, int n);
+#include <span>
+#include "MNISTImporter.hpp"
+#include "Tensor.hpp"
 
 class NeuralNetwork {
 public:
-    NeuralNetwork(size_t batch_size = 64);
+    NeuralNetwork(int batch_size = 32, int hidden_size = 128);
 
     ~NeuralNetwork() noexcept;
 
-    void forward(const MNISTImage& mnist_image);
+    NeuralNetwork(const NeuralNetwork&) = delete;
 
-    f32 backward(int true_label, f32 learning_rate = 0.01f);
+    NeuralNetwork& operator=(const NeuralNetwork&) = delete;
 
-    void train_step(const MNISTImage& mnist_image, f32 learning_rate = 0.01f);
+    NeuralNetwork(NeuralNetwork&&) noexcept = default;
 
-    int predict();
+    NeuralNetwork& operator=(NeuralNetwork&&) noexcept = default;
+
+    void forward(std::span<const MNISTImage> mnist_images);
+
+    f32 backward(std::span<const u8> true_labels, f32 learning_rate = 0.01f);
+
+    f32 train(std::span<const MNISTImage> mnist_images, std::span<const u8> mnist_labels, f32 learning_rate = 0.01f);
+
+    void predict(std::span<u8> output);
 
 private:
-    const size_t B; /* batch size */
-    static constexpr size_t M = 28 * 28;
-    static constexpr size_t N = 10;
+    const int B; /* batch size */
+    const int H; /* hidden layer size */
+    const int M = 28 * 28;
+    const int N = 10;
 
-    Tensor<f32, 2> _x{B, M}; /* input */
-    Tensor<f32, 2> _y{B, N}; /* output */
-    Tensor<f32, 2> _W{M, N}; /* weights */
-    Tensor<f32, 1> _b{N};    /* biases */
+    Tensor<f32> _x{M};
+    Tensor<f32> _y{N};
+    Tensor<f32> _W{M, N};
+    Tensor<f32> _b{N};
 
-    Tensor<f32, 2> _dy{B, N}; /* output gradients */
-    Tensor<f32, 2> _dW{M, N}; /* weight gradients */
-    Tensor<f32, 1> _db{N};    /* bias gradients */
-    Tensor<f32, 1> _loss{B};  /* loss tensor */
+    Tensor<f32> _dy{N};
+    Tensor<f32> _dW{M, N};
+    Tensor<f32> _db{N};
+    Tensor<f32> _loss{1};
+    Tensor<u8> _labels{1};
+    Tensor<u8> _raw{M};
 
     cublasHandle_t _cublas_handle;
 };

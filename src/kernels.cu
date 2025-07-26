@@ -1,220 +1,221 @@
-#include "tensor.hpp"
-#include <curand_kernel.h>
+#include "kernels.h"
 
-// Convert uint8 MNIST pixels [0,255] to normalized float [0,1]
-__global__ void normalize_mnist(const uint8_t* input, float* output, size_t n) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+#include <curand_kernel.h>
+#include <cmath>
+#include <ctime>
+#include "tensor.hpp"
+
+__global__ void normalize_u8_to_f32_kernel(const u8* input, f32* output, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
     if (idx < n) {
         output[idx] = input[idx] / 255.0f;
     }
 }
 
-// Host wrapper
-void launch_normalize_mnist(const uint8_t* input, float* output, size_t n) {
+void normalize_u8_to_f32(const u8* input, f32* output, int n) {
     dim3 block(256);
     dim3 grid((n + block.x - 1) / block.x);
-    normalize_mnist<<<grid, block>>>(input, output, n);
+    normalize_u8_to_f32_kernel<<<grid, block>>>(input, output, n);
 }
 
-// Matrix-vector multiplication: y = A * x
-// A is m x n matrix, x is n-vector, y is m-vector
-__global__ void matvec_kernel(const float* A, const float* x, float* y, int m, int n) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < m) {
-        float sum = 0.0f;
-        for (int col = 0; col < n; col++) {
-            sum += A[row * n + col] * x[col]; // Row-major indexing
-        }
-        y[row] = sum;
-    }
-}
-
-// Host wrapper
-void linear_forward(const float* weights, const float* input, float* output, int input_size, int output_size) {
-    dim3 block(256);
-    dim3 grid((output_size + block.x - 1) / block.x);
-    matvec_kernel<<<grid, block>>>(weights, input, output, output_size, input_size);
-}
-
-// Add bias to each element: y = x + bias
-__global__ void add_bias_kernel(const float* x, const float* bias, float* y, int n) {
+__global__ void init_kernel(f32* W, int n, int fan_in, int fan_out, ulong seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
     if (idx < n) {
-        y[idx] = x[idx] + bias[idx];
+        curandState state;
+        curand_init(seed, idx, 0, &state);
+
+        f32 std_dev = sqrtf(2.0f / (fan_in + fan_out));
+        W[idx]      = curand_normal(&state) * std_dev;
     }
 }
 
-// Host wrappers
-void add_bias(const float* x, const float* bias, float* y, int n) {
+void xavier_init(f32* W, int n, int fan_in, int fan_out) {
     dim3 block(256);
     dim3 grid((n + block.x - 1) / block.x);
-    add_bias_kernel<<<grid, block>>>(x, bias, y, n);
+    init_kernel<<<grid, block>>>(W, n, fan_in, fan_out, (ulong)time(nullptr));
 }
 
-// ReLU activation: y = max(0, x)
-__global__ void relu_kernel(const float* x, float* y, int n) {
+void kaiming_init(f32* W, int n, int fan_in) {
+    dim3 block(256);
+    dim3 grid((n + block.x - 1) / block.x);
+    init_kernel<<<grid, block>>>(W, n, fan_in, 0, (ulong)time(nullptr));
+}
+
+void zero_init(f32* v, int n) {
+    (void)cudaMemset(v, 0, n * sizeof(*v));
+}
+
+__global__ void add_bias_kernel(const f32* x, const f32* b, f32* y, int batch_size, int features) {
+    int batch_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int feat_idx  = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && feat_idx < features) {
+        int idx = batch_idx * features + feat_idx;
+        y[idx]  = x[idx] + b[feat_idx];
+    }
+}
+
+void add_bias(const f32* x, const f32* b, f32* y, int batch_size, int features) {
+    dim3 block(16, 16);
+    dim3 grid((features + block.x - 1) / block.x, (batch_size + block.y - 1) / block.y);
+    add_bias_kernel<<<grid, block>>>(x, b, y, batch_size, features);
+}
+
+__global__ void relu_kernel(const f32* x, f32* y, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
     if (idx < n) {
         y[idx] = fmaxf(0.0f, x[idx]);
     }
 }
 
-void relu_activation(const float* x, float* y, int n) {
+void relu(const f32* x, f32* y, int batch_size, int features) {
+    int n = batch_size * features;
     dim3 block(256);
     dim3 grid((n + block.x - 1) / block.x);
     relu_kernel<<<grid, block>>>(x, y, n);
 }
 
-// Initialize weights with Xavier/Glorot initialization
-__global__ void xavier_init_kernel(float* weights, int n, unsigned long seed) {
+__global__ void relu_backwards_kernel(const f32* dy, const f32* x, f32* dx, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < n) {
+        dx[idx] = (x[idx] > 0.0f) ? dy[idx] : 0.0f;
+    }
+}
+
+void relu_backwards(const f32* dy, const f32* x, f32* dx, int batch_size, int features) {
+    int n = batch_size * features;
+    dim3 block(256);
+    dim3 grid((n + block.x - 1) / block.x);
+    relu_backwards_kernel<<<grid, block>>>(dy, x, dx, n);
+}
+
+__global__ void softmax_cross_entropy_kernel(const f32* logits,
+                                             const u8* true_labels,
+                                             f32* loss,
+                                             f32* gradients,
+                                             int batch_size,
+                                             int num_classes) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size) {
+        const f32* batch_logits = logits + batch_idx * num_classes;
+        f32* batch_gradients    = gradients + batch_idx * num_classes;
+        u8 true_label           = true_labels[batch_idx];
+
+        /* find max in batch */
+        f32 max_logit = batch_logits[0];
+        for (int i = 1; i < num_classes; i++) {
+            max_logit = fmaxf(max_logit, batch_logits[i]);
+        }
+
+        /* compute exp sum */
+        f32 exp_sum = 0.0f;
+        for (int i = 0; i < num_classes; i++) {
+            exp_sum += expf(batch_logits[i] - max_logit);
+        }
+
+        /* compute softmax */
+        for (int i = 0; i < num_classes; i++) {
+            f32 prob           = expf(batch_logits[i] - max_logit) / exp_sum;
+            batch_gradients[i] = prob - (i == true_label ? 1.0f : 0.0f);
+        }
+
+        /* compute loss */
+        f32 true_prob   = expf(batch_logits[true_label] - max_logit) / exp_sum;
+        loss[batch_idx] = -logf(true_prob);
+    }
+}
+
+void softmax_cross_entropy(const f32* logits,
+                           const u8* true_labels,
+                           f32* loss,
+                           f32* gradients,
+                           int batch_size,
+                           int num_classes) {
+    dim3 block(256);
+    dim3 grid((batch_size + block.x - 1) / block.x);
+    softmax_cross_entropy_kernel<<<grid, block>>>(logits, true_labels, loss, gradients, batch_size, num_classes);
+}
+
+__global__ void update_weights_momentum_kernel(f32* W,
+                                               const f32* gradients,
+                                               f32* momentums,
+                                               f32 learning_rate,
+                                               f32 beta,
+                                               int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < n) {
+        // Update momentum: v = beta * v + grad
+        momentums[idx] = beta * momentums[idx] + gradients[idx];
+
+        // Update weights: w = w - lr * v
+        W[idx] -= learning_rate * momentums[idx];
+    }
+}
+
+void update_weights_momentum(f32* W, const f32* gradients, f32* momentums, f32 learning_rate, f32 beta, int n) {
+    dim3 block(256);
+    dim3 grid((n + block.x - 1) / block.x);
+    update_weights_momentum_kernel<<<grid, block>>>(W, gradients, momentums, learning_rate, beta, n);
+}
+
+__global__ void compute_bias_gradients_kernel(const f32* dy, f32* db, int batch_size, int features) {
+    int feat_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (feat_idx < features) {
+        f32 sum = 0.0f;
+        for (int i = 0; i < batch_size; i++) {
+            sum += dy[i * features + feat_idx];
+        }
+        db[feat_idx] = sum / batch_size;
+    }
+}
+
+void compute_bias_gradients(const f32* dy, f32* db, int batch_size, int features) {
+    dim3 block(256);
+    dim3 grid((features + block.x - 1) / block.x);
+    compute_bias_gradients_kernel<<<grid, block>>>(dy, db, batch_size, features);
+}
+
+__global__ void dropout_forward_kernel(const f32* x, f32* y, f32* mask, f32 dropout_rate, int n, ulong seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
     if (idx < n) {
         curandState state;
         curand_init(seed, idx, 0, &state);
 
-        // Xavier initialization: std = sqrt(2.0 / (fan_in + fan_out))
-        // For simplicity, we'll use std = 0.1
-        weights[idx] = curand_normal(&state) * 0.1f;
-    }
-}
-
-// Initialize bias to zero
-__global__ void zero_init_kernel(float* data, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        data[idx] = 0.0f;
-    }
-}
-
-// Host wrappers
-void xavier_init(float* weights, int n) {
-    dim3 block(256);
-    dim3 grid((n + block.x - 1) / block.x);
-    xavier_init_kernel<<<grid, block>>>(weights, n, time(nullptr));
-}
-
-void zero_init(float* data, int n) {
-    dim3 block(256);
-    dim3 grid((n + block.x - 1) / block.x);
-    zero_init_kernel<<<grid, block>>>(data, n);
-}
-
-// Softmax + Cross-entropy loss (combined for numerical stability)
-__global__ void softmax_cross_entropy_kernel(const float* logits,
-                                             int true_label,
-                                             float* loss,
-                                             float* gradients,
-                                             int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        // Softmax with numerical stability
-        float max_logit = logits[0];
-        for (int i = 1; i < n; i++) {
-            max_logit = fmaxf(max_logit, logits[i]);
-        }
-
-        float exp_sum = 0.0f;
-        for (int i = 0; i < n; i++) {
-            exp_sum += expf(logits[i] - max_logit);
-        }
-
-        float softmax_output = expf(logits[idx] - max_logit) / exp_sum;
-
-        // Cross-entropy gradient: softmax_output - true_label_one_hot
-        gradients[idx] = softmax_output - (idx == true_label ? 1.0f : 0.0f);
-
-        // Loss (only compute once)
-        if (idx == 0) {
-            *loss = -logf(expf(logits[true_label] - max_logit) / exp_sum);
+        f32 rand_val = curand_uniform(&state);
+        if (rand_val < dropout_rate) {
+            mask[idx] = 0.0f;
+            y[idx]    = 0.0f;
+        } else {
+            mask[idx] = 1.0f / (1.0f - dropout_rate);
+            y[idx]    = x[idx] * mask[idx];
         }
     }
 }
 
-// Host wrapper
-void softmax_cross_entropy(const float* logits, int true_label, float* loss, float* gradients, int n) {
+void dropout_forward(const f32* x, f32* y, f32* mask, f32 dropout_rate, int n) {
     dim3 block(256);
     dim3 grid((n + block.x - 1) / block.x);
-    softmax_cross_entropy_kernel<<<grid, block>>>(logits, true_label, loss, gradients, n);
+    dropout_forward_kernel<<<grid, block>>>(x, y, mask, dropout_rate, n, (ulong)time(nullptr));
 }
 
-// Compute softmax loss and gradients
-__global__ void compute_loss_and_gradients_kernel(const float* output,
-                                                  int true_label,
-                                                  float* loss,
-                                                  float* output_gradients,
-                                                  int n) {
-    // Find max for numerical stability
-    float max_val = output[0];
-    for (int i = 1; i < n; i++) {
-        max_val = fmaxf(max_val, output[i]);
-    }
-
-    // Compute exp sum
-    float exp_sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        exp_sum += expf(output[i] - max_val);
-    }
-
+__global__ void dropout_backward_kernel(const f32* dy, const f32* mask, f32* dx, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
     if (idx < n) {
-        // Softmax probability
-        float prob = expf(output[idx] - max_val) / exp_sum;
-
-        // Gradient = probability - true_label_one_hot
-        output_gradients[idx] = prob - (idx == true_label ? 1.0f : 0.0f);
-
-        // Store loss (only thread 0)
-        if (idx == 0) {
-            float true_prob = expf(output[true_label] - max_val) / exp_sum;
-            *loss           = -logf(true_prob);
-        }
+        dx[idx] = dy[idx] * mask[idx];
     }
 }
 
-// Compute weight gradients: grad_W[i,j] = input[j] * output_grad[i]
-__global__ void compute_weight_gradients_kernel(const float* input,
-                                                const float* output_gradients,
-                                                float* weight_gradients,
-                                                int input_size,
-                                                int output_size) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y; // output neuron
-    int col = blockIdx.x * blockDim.x + threadIdx.x; // input neuron
-
-    if (row < output_size && col < input_size) {
-        int idx               = row * input_size + col;
-        weight_gradients[idx] = input[col] * output_gradients[row];
-    }
-}
-
-// Update weights: w = w - learning_rate * gradient
-__global__ void update_weights_kernel(float* weights, const float* gradients, float learning_rate, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        weights[idx] -= learning_rate * gradients[idx];
-    }
-}
-
-// Host wrappers
-void compute_loss_and_gradients(const float* output, int true_label, float* loss, float* output_gradients, int n) {
+void dropout_backward(const f32* dy, const f32* mask, f32* dx, int n) {
     dim3 block(256);
     dim3 grid((n + block.x - 1) / block.x);
-    compute_loss_and_gradients_kernel<<<grid, block>>>(output, true_label, loss, output_gradients, n);
-}
-
-void compute_weight_gradients(const float* input,
-                              const float* output_gradients,
-                              float* weight_gradients,
-                              int input_size,
-                              int output_size) {
-    dim3 block(16, 16);
-    dim3 grid((input_size + block.x - 1) / block.x, (output_size + block.y - 1) / block.y);
-    compute_weight_gradients_kernel<<<grid, block>>>(
-        input, output_gradients, weight_gradients, input_size, output_size);
-}
-
-void update_weights(float* weights, const float* gradients, float learning_rate, int n) {
-    dim3 block(256);
-    dim3 grid((n + block.x - 1) / block.x);
-    update_weights_kernel<<<grid, block>>>(weights, gradients, learning_rate, n);
+    dropout_backward_kernel<<<grid, block>>>(dy, mask, dx, n);
 }
