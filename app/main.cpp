@@ -17,7 +17,7 @@ int main() {
             const auto& image = train_images[i];
             const auto& label = train_labels[i];
 
-            f32 loss = nn.train({&image, 1}, {&label, 1}, 0.00001f);
+            f32 loss = nn.train({&image, 1}, {&label, 1}, 1e-6f);
 
             if (i % 1000 == 0) {
                 std::println("Loss: {:.3f}", loss);
@@ -37,15 +37,10 @@ int main() {
 
             if (prediction == label) {
                 correct++;
-            } else {
-                // image.debug();
-                // std::println("prediction: {}, true: {}", prediction, label);
             }
         }
-        std::println("Final Accuracy: ({}/{}) {:.2f}%",
-                     correct,
-                     t10k_images.size(),
-                     ((float)correct / (float)t10k_images.size()) * 100.0f);
+        std::println(
+            "Final Accuracy: ({}/{}) {:.2f}%", correct, t10k_images.size(), 100.0f * correct / t10k_images.size());
     } catch (const std::exception& err) {
         std::println(stderr, "{}", err.what());
         return -1;

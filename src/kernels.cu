@@ -67,7 +67,7 @@ __global__ void relu_kernel(const f32* x, f32* y, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < n) {
-        y[idx] = fmaxf(0.0f, x[idx]);
+        y[idx] = (x[idx] > 0.0f) ? x[idx] : 0.01f * x[idx];
     }
 }
 
@@ -82,7 +82,7 @@ __global__ void relu_backwards_kernel(const f32* dy, const f32* x, f32* dx, int 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (idx < n) {
-        dx[idx] = (x[idx] > 0.0f) ? dy[idx] : 0.0f;
+        dx[idx] = (x[idx] > 0.0f) ? dy[idx] : 0.01f * dy[idx];
     }
 }
 
